@@ -1,0 +1,11 @@
+#!/bin/sh
+#
+# (a) 2006 nolar@numeri.net
+#
+# ...
+#
+
+. /etc/traffic.conf
+
+identifier="mail"
+qmailhistory="/data/traffic/history.$identifier"

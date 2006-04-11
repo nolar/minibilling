@@ -1,0 +1,11 @@
+#
+# Внимание! Этот файл по задумке содержит пароль подключения к базе данных.
+# Не забудьте ПЕРЕД его изменением выставить ему очень строгие права (например, 0600).
+#
+
+[client]
+database=billing
+host=localhost
+user=billing
+password="guess_what;)"
+set-variable = max_allowed_packet=16M

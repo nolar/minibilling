@@ -1,0 +1,376 @@
+#!/bin/sh
+####################################################################################################
+##                                    ПЕРВИЧНЫЕ    ОПРЕДЕЛЕНИЯ                                    ##
+####################################################################################################
+#
+# Нужные для файрвола команды с полными путями к ним (и параметрами, если надо).
+#
+
+ipfw='/sbin/ipfw -q'
+ifconfig='/sbin/ifconfig'
+logger='/usr/bin/logger'
+cat='/bin/cat'
+awk='/usr/bin/awk'
+
+#
+# Важные определения и заготовки (конфигурационные параметры файрвола).
+#
+#   ethif	- Интерфейс (можно маску) с прямым подключением в локальную сеть.
+#		  Имеется ввиду незащищенное соединение, например, по soho-свитчу.
+#
+#   tunif	- Интерфейс (можно маску) с защитой подключения по локальной сети.
+#		  Имеется ввиду защита методом точной авторизации, например, по паролю.
+#
+#   ispif	- Интерфейсы подключения к провайдерам. Маски недопустимы.
+#		  Имеет смысл заполнять только чтобы исключить конкретные интерфейсы из
+#		  множества интерфейсов, задаваемых масками в ethif & tunif.
+#
+#   ethip	- Адресное пространство локальной сети на незащищенных интерфейсах.
+#
+#   tunip	- Адресное пространство локальной сети на защищенных интерфейсах.
+#
+#   freeip	- Адресное пространство провайдеров с бесплатным трафиком.
+#		  Для него будут особые привелегии доступа (например, к файловым ресурсам).
+#
+#   paidip	- (пока не используется. по задумке - адреса с платным, но дешевым трафиком).
+#
+#   bc		- Вспомогательное определение для возможных броадкастов, которые мы можем получить.
+#   mc		- Вспомогательные определение для возможных мультикастов, которые мы можем получить.
+#   me		- Вспомогательное определение для собственных адресов. Обычно равно 'me'.
+#
+#   blockusers	- Список пользователей (login или uid), которым будет заблокирован доступ куда-либо.
+#
+
+ethif="homenet"
+tunif="ng*"
+ispif="ng0"
+
+ethip="10.0.0.0/24"
+tunip="10.0.0.0/24"
+freeip="10.10.0.0/16 or 192.168.0.0/16 or 87.236.41.0/24{0-245,247-255} or 87.236.40.0/24{0-58,60-242,245-255}"
+peerip="87.236.41.246 or 87.236.42.0/24 or 80.91.192.0/20 or 80.255.136.192/26 or 80.255.133.128/26 or 62.213.40.0/26 or 62.213.41.0/25 or 87.236.40.0/24{59,243,244}"
+
+bc="0.0.0.255:0.0.0.255 or 0.0.255.255:0.0.255.255 or 0.255.255.255:0.255.255.255 or 255.255.255.255:255.255.255.255"
+mc="224.0.0.0/4"
+me="me"
+
+blockusers=""
+blockusers="$blockusers "`$cat /etc/passwd | $awk 'BEGIN {FS=":"} /^www-/ {print $3}'`
+blockusers="$blockusers "`$cat /etc/passwd | $awk 'BEGIN {FS=":"} /^adm-/ {print $3}'`
+
+natlist="kraslan"
+nat_kraslan_addr="$me"
+nat_kraslan_iface="ng0"
+nat_kraslan_iport="8661"
+nat_kraslan_oport="8662"
+nat_kraslan_fakeset="14"
+nat_kraslan_realset="30"
+nat_kraslan_accesslist="free peer inet" #inet!!!
+nat_kraslan_access_free_source="$ethip or $tunip"
+nat_kraslan_access_free_target="$freeip"
+nat_kraslan_access_peer_source="$ethip or $tunip"
+nat_kraslan_access_peer_target="$peerip"
+nat_kraslan_access_inet_source="$ethip or $tunip"
+nat_kraslan_access_inet_target="any"
+
+####################################################################################################
+##                                    НАЧАЛО ПОСТРОЕНИЯ ПРАВИЛ                                    ##
+####################################################################################################
+#
+# Используемые группы правил и их задуманное состояние:
+#   00-15 - disabled - для добавления новых правил при работе скрипта
+#   16-31 - enabled  - для рабочих правил во время работы скрипта и вообще всегда
+#
+# Общий принцип - первые 16 группе (0-15) используются для добавления новых правил
+# и всегда выключены чтобы не создавать помех. После добавления новых правил
+# происходит перемещение в группу с номером на 16 больше чем исходная
+# (00->16, 01->17, ... 14->30, 15->31).
+#
+# В частности, особые группы:
+#   14,30 - dynamic - диверт для туннельного сетевого интерфейса к провайдеру, автовключение.
+#   15,31 - enabled - группа правил, которые не стираются при ipfw flush.
+#
+# Перед и после работы скрипта disabled-группы очищаются от всех правил.
+# Перед - чтобы предотвратить проникновение тестовых ручных правил в систему.
+# После - чтобы после обмена правил в группах эти группы были пусты и не создавали мусора.
+# Смена групп правил происходит атомарно, после всех добавлений, но перед очисткой групп.
+#
+
+# Отключаем и очищаем от правил все вспомогательные группы и начинаем их заполнять.
+$ipfw set disable 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+$ipfw delete set  0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+
+####################################################################################################
+# Определение категории трафика и переброс на соответствующую группу правил.
+####################################################################################################
+
+# Разрешаем весь трафик через loopback и запрещаем loopback-адреса на других интерфейсах.
+$ipfw add 10 allow all from any to any via lo0
+$ipfw add 11 deny log all from 127.0.0.0/8 to any
+$ipfw add 12 deny log all from any to 127.0.0.0/8
+
+# Разрешаем весь трафик layer2, так как анализ идет на более высоком уровне (см. ниже).
+$ipfw add 20 allow all from any to any layer2
+
+# Определяем входящий или исходящий трафик и перебрасываем на соответствующую группу правил.
+$ipfw add 31 skipto 10000 in
+$ipfw add 32 skipto 40000 out
+
+# НЕМЫСЛИМО! Если это правило случится, то значит файрвол составлен неправильно.
+$ipfw add 99 deny log all from any to any
+
+####################################################################################################
+# Правила для входящего трафика (нумерация с 10000)
+####################################################################################################
+
+# Anti-Spoofing на входном трафике.
+# Сначала мы отбрасываем из рассмотрения пакеты на заведомо провайдерских интерфейсах.
+# Потом допускаем к дальнейшему рассмотрению локальные адреса на локальных интерфейсах,
+# и при этом полностью запрещаем все прочие адреса на тех же локальных интерфейсах.
+# А затем, уже снова включив провайдерские интерфейсы в рассмотрение, запрещаем
+# трафик с наших локальных адресов, но пришедшие с внешних (провайдерских) интерфейсов.
+for i in $ispif; do
+$ipfw add 10100 skipto 10190 all from any to any recv $i
+done
+$ipfw add 10110 skipto 10199 all from { $ethip or 0.0.0.0 } to any recv $ethif
+$ipfw add 10120 skipto 10199 all from { $ethip or $tunip  } to any recv $tunif
+$ipfw add 10130 deny log     all from any                   to any recv $ethif
+$ipfw add 10140 deny log     all from any                   to any recv $tunif
+$ipfw add 10190 deny log     all from { $ethip or $tunip  } to any
+
+# Оберегаем локальную сеть от подделки локальных адресов со стороны провайдеров.
+# Сначала мы отбрасываем из рассмотрения пакеты на заведомо провайдерских интерфейсах.
+# Потом допускаем к дальнейшему рассмотрению трафик на локальные адреса только если
+# он пришел с локальных же интерфейсов (то есть ходит внутри локальной сети).
+# После чего, снова включив в рассмотрение провайдерские интерфейсы, запрещаем весь
+# трафик на локальные адреса с внешних (провайдерских) интерфейсов.
+for i in $ispif; do
+$ipfw add 10200 skipto 10290 all from any to any recv $i
+done
+$ipfw add 10210 skipto 10299 all from any to { $ethip or $tunip } recv $ethif		# переводим на обычную проверку пакеты на адреса локальной сети, полученные с локальных ethernet нтерфейсов.
+$ipfw add 10220 skipto 10299 all from any to { $ethip or $tunip } recv $tunif		# переводим на обычную проверку пакеты на адреса локальной сети, полученные с локальных tunnel нтерфейсов.
+$ipfw add 10290 deny log     all from any to { $ethip or $tunip }			# сюда приходит skipto! запрещаем пакеты на адреса локальной сети с не-локальных интерфейсов.
+
+# NAT (Network Address Translation) - поиск ранее созданной записи в таблицах трансляции.
+# Выполняется после основных защит от спуфинга и подделки адресов, потому как иначе может
+# забраковать приемлимые пакеты, адресованные локальной сети только после NAT'ования.
+# Выполняется после основных обязательных защит, но перед любой простой обработкой трафика.
+for i in $natlist ; do
+eval i_addr=\$nat_${i}_addr
+eval i_iface=\$nat_${i}_iface
+eval i_iport=\$nat_${i}_iport
+eval i_fakeset=\$nat_${i}_fakeset
+$ipfw add 10300 set $i_fakeset divert $i_iport all from any to { $i_addr } recv $i_iface
+done
+
+# Обрабатываем трафик из локальной сети до сохранения в биллинг
+for i in $ispif; do
+$ipfw add 10400 skipto 10499 all from any to any recv $i
+done
+$ipfw add 10410 skipto 20000 all from any to { $me or $bc or $mc } recv $ethif
+$ipfw add 10420 skipto 20000 all from any to { $me or $bc or $mc } recv $tunif
+$ipfw add 10430 allow        all from any to   any                 recv $ethif
+$ipfw add 10440 allow        all from any to   any                 recv $tunif
+
+# Сохраняем ранее не перехваченный входящий трафик в биллинг, то есть любой трафик,
+# пришедший с любого провайдерского интерфейса (но никогда - с локального).
+# Сохраняется именно копия трафика. Сам трафик далее обрабатывается как обычно.
+# Заметка: трафик, который мы отбросили ранее (спуфинг и прочий хакинг), не вносится.
+# С ним нужно разбираться на основании логов. Он не является полезным несущим трафиком,
+# и в биллинге провайдера нам не зачтется, так как идет с неправильными адресами.
+$ipfw add 10500 tee 4001 all from any to any
+
+# Особо обрабатываем трафик, адресованный непосредственно этому хосту (роутеру).
+# Причем проверка трафика "на себя" производится после NAT'ов, чтобы отсеять
+# те пакеты, которые пришли на мой адрес, но были преобразованы в nat-divert.
+$ipfw add 10600 skipto 20000 all from any to { $me or $bc or $mc }
+
+# Разрешаем транзитный трафик на локальные адреса уже после NAT'ов.
+# Трафик на локальные адреса с внешних интерфейсов, который является попыткой взлома,
+# отсеен ранее, еще до NAT'ов.
+$ipfw add 10900 allow all from any to { $ethip or $tunip }
+
+# НЕМЫСЛИМО! Это правило никогда не должно случаться, потому что весь трафик должен быть обработан ранее.
+$ipfw add 19999 deny log all from any to any
+
+####################################################################################################
+# Правила для входящего трафика к этому роутеру (нумерация с 20000)
+####################################################################################################
+
+# Допускаем трафик к этому роутеру для уже установленных TCP/UDP
+$ipfw add 20010 allow all from any to any frag		# всегда пропускаем фрагменты пакетов, так как они не имеют данных о портах и пр. а может поумнее сделать???
+$ipfw add 20020 allow tcp from any to any established	# всегда пропускаем tcp-пакеты к якобы начатым сессиям. может сделать помнее??? за счет keep-state, например.
+$ipfw add 20030 check-state				# находим установленные ранее связи, и разрешаем их.
+
+# Запрещаем инет юзерам (трафик, входящий на этот сервер для юзера X). Уже после проверки check-state!
+for i in $blockusers ; do
+$ipfw add 20090 unreach host log all from any to any uid $i #log???
+done
+
+# Разрешенные протоколы на этом роутере (которые не имеют портов).
+$ipfw add 21001 allow icmp from any to any					# управляющий протокол (ping, traceroute, etc.)
+$ipfw add 21002 allow igmp from any to any					# регистрация в мультикаст-групах
+$ipfw add 21003 allow gre  from any to any					# туннелирование трафика (vpn)
+
+# Разрешенные TCP-сервисы непосредственно на этом роутере.
+$ipfw add 22001 allow tcp from any        to any                21 keep-state setup	# ftp (see /usr/local/etc/ftpd.conf for 'portrange')
+$ipfw add 22002 allow tcp from any        to any                20 keep-state setup	# ftp (see /usr/local/etc/ftpd.conf for 'portrange')
+$ipfw add 22003 allow tcp from any        to any       49152-65535 keep-state setup	# ftp (see /usr/local/etc/ftpd.conf for 'portrange')
+$ipfw add 22004 allow tcp from any        to any                22 keep-state setup	# ssh
+$ipfw add 22005 allow tcp from any        to any                25 keep-state setup	# smtp
+$ipfw add 22006 allow tcp from any        to any                53 keep-state setup	# dns (zone xfer)
+$ipfw add 22007 allow tcp from any        to any                80 keep-state setup	# http
+$ipfw add 22008 allow tcp from any        to any              8080 keep-state setup	# http (redirect to nola)
+$ipfw add 22009 allow tcp from any        to any              8081 keep-state setup	# http (redirect to nola)
+$ipfw add 22010 allow tcp from any        to any               110 keep-state setup	# pop3
+$ipfw add 22011 allow tcp from any        to any               143 keep-state setup	# imap
+$ipfw add 22012 allow tcp from any        to any              1079 keep-state setup	# socks (pseudo-port)
+$ipfw add 22013 allow tcp from any        to any              3306 keep-state setup	# mysql
+$ipfw add 22014 allow tcp from any        to any             12450 keep-state setup	# dc, direct connect (p2p) -> nola redirect
+
+# Разрешенные UDP-сервисы непосредственно на этом роутере.
+$ipfw add 23001 allow udp from any     67 to 255.255.255.255    68			# dhcp (initial reply to us, if we request). do not keep state.
+$ipfw add 23002 allow udp from 0.0.0.0 68 to any                67			# dhcp (initial request to us, if we are server). do not keep state.
+$ipfw add 23003 allow udp from any     68 to any                67 keep-state		# dhcp (prolongation request to us, if we are server).
+$ipfw add 23004 allow udp from any        to any                53 keep-state		# dns (request to us)
+$ipfw add 23005 allow log udp from any     53 to any                   keep-state		# dns (reply to us). must not be!!! должно обрабатываться на уровне check-state!!!
+$ipfw add 23006 allow udp from any        to any             17997 keep-state		# dc, direct connect (p2p) -> nola redirect
+
+# Запрещенные TCP-сервисы непосредственно на этом роутере.
+$ipfw add 24001 unreach port tcp from any to any               113			# ident (для быстрого входа в irc)
+$ipfw add 24002 unreach port tcp from any to any               135			# ???
+$ipfw add 24003 unreach port tcp from any to any               445			# ms-??? (some virus use this).
+$ipfw add 24004 unreach port tcp from any to any              1080			# socks (for scanners)
+
+# Запрещенные UDP-сервисы непосредственно на этом роутере.
+
+# NetBios (там сложная структура протоколов, поэтому отдельной группой).
+$ipfw add 25000 allow        all from any to any 137					# NetBios name resolution.
+$ipfw add 25010 skipto 25050 all from { 87.236.41.246 } to any 138-139			# XL (платный пиринг)
+$ipfw add 25021 allow        tcp from { $ethip or $tunip or 10.10.0.0/16 or 192.168.0.0/16 or 87.236.41.0/24 } to any 138-139 keep-state setup
+$ipfw add 25022 allow        udp from { $ethip or $tunip or 10.10.0.0/16 or 192.168.0.0/16 or 87.236.41.0/24 } to any 138-139 keep-state
+$ipfw add 25050 unreach host all from any to any 138-139				#
+
+# Полное запрещение непредусмотренного входящего трафика на себя (и протоколирование).
+$ipfw add 29999 unreach port log all from any to any
+
+####################################################################################################
+# Правила для исходящего трафика (нумерация с 40000)
+####################################################################################################
+
+# Разрешаем трафик на локальную сеть через локальный интерфейс и запрещаем через другие
+# Правила на выходе чуть проще правил на входе, потому что все явные атаки мы отразили именно на входе.
+for i in $ispif; do									#
+$ipfw add 40100 skipto 40190 all from any to any xmit $i				# проматываем все интерфейсы, которые четко указаны как провайдерские, но могут попасть в локальные по маске имени.
+done											#
+$ipfw add 40110 skipto 50000 all from { $me or 0.0.0.0 } to { $ethip or $tunip or $bc or $mc } xmit $ethif
+$ipfw add 40120 skipto 50000 all from { $me or 0.0.0.0 } to { $ethip or $tunip or $bc or $mc } xmit $tunif
+$ipfw add 40130 allow        all from   any              to { $ethip or $tunip or $bc or $mc } xmit $ethif
+$ipfw add 40140 allow        all from   any              to { $ethip or $tunip or $bc or $mc } xmit $tunif
+$ipfw add 40150 deny log     all from   any              to   any                              xmit $ethif
+$ipfw add 40160 deny log     all from   any              to   any                              xmit $tunif
+$ipfw add 40190 deny log     all from   any              to { $ethip or $tunip }
+
+# Сохраняем ранее не перехваченный исходящий трафик в биллинг, то есть любой трафик,
+# уходящий на любой провайдерский интерфейс (но никогда - на локальный).
+# Сохраняется именно копия трафика. Сам трафик далее обрабатывается как обычно.
+# Заметка: трафик, который мы отбросили ранее (спуфинг и прочий хакинг), не вносится.
+# С ним нужно разбираться на основании логов. Он не является полезным несущим трафиком,
+# и в биллинге провайдера нам не зачтется, так как идет с неправильными адресами.
+$ipfw add 40200 tee 4002 all from any to any
+
+# Обрабатываем трафик от этого роутера, включая DHCP-запросы от нас самих.
+# Причем обрабатываем еще до NAT'ов, потому что иначе мы потом не отличим свой трафик
+# от NAT'ованного трафика из локальной сети.
+$ipfw add 40300 skipto 50000 all from { $me or 0.0.0.0 } to any
+
+# NAT - создание записи в таблицах трансляции
+for i in $natlist ; do
+eval i_addr=\$nat_${i}_addr
+eval i_iface=\$nat_${i}_iface
+eval i_oport=\$nat_${i}_oport
+eval i_fakeset=\$nat_${i}_fakeset
+eval i_accesslist=\$nat_${i}_accesslist
+for j in $i_accesslist ; do
+eval j_source=\$nat_${i}_access_${j}_source
+eval j_target=\$nat_${i}_access_${j}_target
+$ipfw add 40500 set $i_fakeset divert $i_oport all from { $j_source } to { $j_target } xmit $i_iface
+done
+$ipfw add 40600 allow all from { $i_addr } to any xmit $i_iface
+done
+
+# Запрещаем исходящий трафик из локальной сети при закрытом доступе
+$ipfw add 40700 unreach host-prohib log all from { $ethip or $tunip } to any #log???
+
+# НЕМЫСЛИМО! Запрещаем прочий исходящий трафик, которого (теоретически), быть не может.
+$ipfw add 49999 deny log all from any to any
+
+####################################################################################################
+## Правила для исходящего трафика с этого роутера (нумерация с 50000)                             ##
+####################################################################################################
+
+# Допускаем трафик с этого роутера для уже установленных TCP/UDP
+$ipfw add 50000 allow all from any to any frag
+$ipfw add 50010 allow tcp from any to any established
+$ipfw add 50030 check-state
+
+# Запрещаем инет юзерам (трафик, исходящий с этого сервера от юзера X). Уже после проверки check-state!
+for i in $blockusers ; do
+$ipfw add 50090 unreach host log all from any to any uid $i #log???
+done
+
+# Разрешенные протоколы на этом роутере
+$ipfw add 51001 allow icmp from any to any
+$ipfw add 51002 allow igmp from any to any
+$ipfw add 51003 allow gre  from any to any
+
+# Разрешаем весь исходящий трафик с этого роутера
+$ipfw add 52001 allow tcp from any to any keep-state setup
+$ipfw add 52002 allow all from any to any keep-state
+
+# Полное запрещение непредусмотренного исходящего трафика с этого роутера.
+$ipfw add 59999 deny log all from any to any
+
+####################################################################################################
+##                                       АКТИВИРУЕМ ПРАВИЛА                                       ##
+####################################################################################################
+
+# Пишем сообщение в syslog о перезапуске файрвола
+$logger -p security.info FIREWALL RESTART
+
+# Проверяем состояние VPN и выставляем режим для группы VPN-divert'а
+for i in $natlist ; do
+eval i_iface=\$nat_${i}_iface
+eval i_realset=\$nat_${i}_realset
+if $ifconfig $i_iface 1>/dev/null 2>&1 ; then
+$ipfw set enable  $i_realset
+else
+$ipfw set disable $i_realset
+fi
+done
+
+# Перекидываем правила из вспомогательных групп в рабочие
+$ipfw set swap  0 16
+$ipfw set swap  1 17
+$ipfw set swap  2 18
+$ipfw set swap  3 19
+$ipfw set swap  4 20
+$ipfw set swap  5 21
+$ipfw set swap  6 22
+$ipfw set swap  7 23
+$ipfw set swap  8 24
+$ipfw set swap  9 25
+$ipfw set swap 10 26
+$ipfw set swap 11 27
+$ipfw set swap 12 28
+$ipfw set swap 13 29
+$ipfw set swap 14 30
+$ipfw set swap 15 31
+
+# Очищаем вспомогательные группы чтобы не создавать мусора и включаем их для порядка
+$ipfw delete set 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+$ipfw set enable 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+
+####################################################################################################
+##                                        КРАСИВО  ВЫХОДИМ                                        ##
+####################################################################################################

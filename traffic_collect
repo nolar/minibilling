@@ -1,0 +1,181 @@
+#!/bin/sh
+#
+# (a) 2006 nolar@numeri.net
+#
+# Этот скрипт просто вытаскивает данные из коллектора (ngipacct) для указанного интерфейса,
+# и заносит эти данные в файл, а сам файл помещает в каталог с подобными файлами трафика.
+# Имя файла создается уникальным на основе текущего времени с точностью до секунд, имени
+# опрашиваемого интерфейса, направления трафика (i - входящий, o - исходящий; терминология
+# входящего/исходящего исключительно как она понимается ipacctctl, см. его параметры -i/-o),
+# и, на всякий случай, pid ныне выполняемого скрипта (шелла). Имя готового файла всегда
+# заканчивается на ".data". Временные файлы в процессе создания заканчиваются на ".temp".
+# Частота сборки трафика задается где-нибудь извне, например в cron. В один и тот же момент
+# времени для одного интерфейса работает только один процесс сборки, так что взаимного
+# влияния при работе с ngipacct не случится.
+#
+# Первым и обязательным параметром принимает имя файла с настройками.
+#
+
+# Подключаем конфиг. Должен быть указан!
+[ -f "$1" -a -r "$1" ] || { echo "Must specify config file as first parameter."	>&2; exit 3; }
+. "$1"
+
+# Проверяем что каталоги существуют, что они читабельны и доступны на запись.
+[ -z "$lckdir" ] && { echo "Lock directory does not specified. Bye."		>&2; exit 2; }
+[ -d "$lckdir" ] || { echo "Directory '$lckdir' does not exist. Bye."		>&2; exit 2; }
+[ -r "$lckdir" ] || { echo "Directory '$lckdir' is not readable. Bye."		>&2; exit 2; }
+[ -w "$lckdir" ] || { echo "Directory '$lckdir' is not writeable. Bye."		>&2; exit 2; }
+[ -z "$tmpdir" ] && { echo "Temporary directory does not specified. Bye."	>&2; exit 2; }
+[ -d "$tmpdir" ] || { echo "Directory '$tmpdir' does not exist. Bye."		>&2; exit 2; }
+[ -r "$tmpdir" ] || { echo "Directory '$tmpdir' is not readable. Bye."		>&2; exit 2; }
+[ -w "$tmpdir" ] || { echo "Directory '$tmpdir' is not writeable. Bye."		>&2; exit 2; }
+[ -z "$newdir" ] && { echo "New-traffic directory does not specified. Bye."	>&2; exit 2; }
+[ -d "$newdir" ] || { echo "Directory '$newdir' does not exist. Bye."		>&2; exit 2; }
+[ -r "$newdir" ] || { echo "Directory '$newdir' is not readable. Bye."		>&2; exit 2; }
+[ -w "$newdir" ] || { echo "Directory '$newdir' is not writeable. Bye."		>&2; exit 2; }
+
+# Проверяем наличие нужных нам параметров настройки.
+[ -z "$identifier"    ] && { echo "Identifier does not specified. Bye."		>&2; exit 2; }
+[ -z "$ngipacct_node" ] && { echo "Node for ngipacct does not specified. Bye."	>&2; exit 2; }
+
+# Проверяем, надо ли забрасывать трафик сразу после его сборки с коллектора.
+# Исправляем значение на то, которое нам позже легче будет проверить.
+case "$autoinject" in
+	[Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|[Oo][Nn]|1)     autoinject="1";;
+	[Nn][Oo]|[Ff][Aa][Ll][Ss][Ee]|[Oo][Ff][Ff]|0) autoinject="" ;;
+	*) echo "Autoinject has wrong value '$autoinject'."			>&2; exit 2;;
+esac
+
+# Защищаем файлы с сырым трафиком от стороннего их прочтения. Просто защиты по правам
+# каталогов недостаточно, так как пользователи системы могут создать жесткий линк на
+# i-node файла, и получить к нему доступ, если с файла явно не сняты общие права.
+umask 077
+
+# Проверяем, было ли указано вторым параметром ключевое (не секретное, а просто ключевое)
+# слово. Если это слово было указано, то мы считаем что нас запустили на сбор трафика.
+# Причем обо всех lock'ах уже позаботились и вторая копия скрипта не запустится.
+if [ "$2" = "do" ] ; then
+
+	# Составляем уникальные имена для файлов данных.
+	stamp=`date +%Y%m%d%H%M%S` \
+		|| { echo "Failed to get current stamp."			>&2; exit 1; }
+	tmpifile="$tmpdir/$stamp.$identifier.i.$$.temp"
+	tmpofile="$tmpdir/$stamp.$identifier.o.$$.temp"
+	newifile="$newdir/$stamp.$identifier.i.$$.data"
+	newofile="$newdir/$stamp.$identifier.o.$$.data"
+
+	# Удаляем файлы для трафика, если они существуют. Но существовать они не должны,
+	# потому что в составлении их имени принимают участие время и pid процесса, и
+	# повтор возможен только если в пределах той же секунды этот файл был создан
+	# скриптом с тем же pid, что и мы сами, и при этом не был удален или перемещен.
+	# Вероятность такого стремится к нулю. А если такое и случается, то сам факт того,
+	# что файл не был удален или перемещен, означает что и трафик в нем не был
+	# сброшен с checkpoint-базы и будет повторен в других файлах (включая те, что мы
+	# сами создадим).
+	{ [ ! -e "$tmpifile" ] || rm -rf "$tmpifile"; }	\
+		|| { echo "Failed to remove '$tmpifile'."			>&2; exit 1; }
+	{ [ ! -e "$tmpofile" ] || rm -rf "$tmpofile"; }	\
+		|| { echo "Failed to remove '$tmpofile'."			>&2; exit 1; }
+	{ [ ! -e "$newifile" ] || rm -rf "$newifile"; }	\
+		|| { echo "Failed to remove '$newifile'."			>&2; exit 1; }
+	{ [ ! -e "$newofile" ] || rm -rf "$newofile"; }	\
+		|| { echo "Failed to remove '$newofile'."			>&2; exit 1; }
+
+	# Создаем файлы для получения трафика. Если создание файлов не удалось, то
+	# вылетаем по ошибке именно здесь, а не дожидаемся такого же вылета далее
+	# в скрипте.
+	touch "$tmpifile" \
+		|| { echo "Failed to create file '$tmpifile'."			>&2; exit 1; }
+	touch "$tmpofile" \
+		|| { echo "Failed to create file '$tmpofile'."			>&2; exit 1; }
+
+	# Сохраняем уже выведенный в checkpoint-базу трафик, чтобы его не потерять.
+	ipacctctl -n -i "$ngipacct_node" show >> "$tmpifile" \
+		|| { echo "Failed to retreive incoming traffic from '$ngipacct_node' to '$tmpifile'. Continuing."; }
+	ipacctctl -n -o "$ngipacct_node" show >> "$tmpofile" \
+		|| { echo "Failed to retreive outgoing traffic from '$ngipacct_node' to '$tmpofile'. Continuing."; }
+
+	# Очищаем checkpoint-базу для получения нового трафика.
+	# Если базу очистить не удалось, то и файлы с трафиком мы не переносим в чистовой
+	# каталог, так как следующая итерация коллектора снова получит тот же трафик из
+	# checkpoint-базы. Мы их просто удаляем (для поддержания чистоты), а если удаление
+	# не получится - оставляем где они есть на дальнейшую обработку админом.
+	ipacctctl "$ngipacct_node" clear \
+		|| {
+			rm -rf "$tmpifile" || echo "Can not remove '$tmpifile'."
+			rm -rf "$tmpofile" || echo "Can not remove '$tmpofile'."
+			echo "Failed to clear checkpoint database."		>&2; exit 1;
+		}
+
+	# Получаем новый трафик в checkpoint-базу.
+	# Если получить трафик не удалось, то просто переносим уже полученные файлы с
+	# трафиком в чистовой каталог, а сами выходим с ошибкой. Иначе нельзя - ведь
+	# трафик уже сброшен из checkpoint-базы предыдущим clear, и существует только
+	# в этих файлах.
+	# Выходим именно с кодом 0, так как новые файлы мы все-таки создали.
+	ipacctctl "$ngipacct_node" checkpoint \
+		|| {
+			mv -f "$tmpifile" "$newifile" || echo "Can not move '$tmpifile' to '$newifile'."
+			mv -f "$tmpofile" "$newofile" || echo "Can not move '$tmpofile' to '$newofile'."
+			echo "Failed to checkpoint, but previous traffic was saved." >&2; exit 0;
+		}
+
+	# Если же получение трафика в checkpoint-базу прошло успешно, то сохраняем только
+	# что полученный трафик в те же файлы с трафиком.
+	ipacctctl -n -i "$ngipacct_node" show >> "$tmpifile" \
+		|| { echo "Failed to retreive incoming traffic from '$ngipacct_node' to '$tmpifile'. Continuing." >&2; }
+	ipacctctl -n -o "$ngipacct_node" show >> "$tmpofile" \
+		|| { echo "Failed to retreive outgoing traffic from '$ngipacct_node' to '$tmpofile'. Continuing." >&2; }
+
+	# Очищаем после себя checkpoint-базу.
+	# Вот если тут возникнет ошибка, то это уже проблема. Часть трафика уже выведена
+	# в файлы и существуют только в них. И новый трафик в этих же файлах, и мы не
+	# можем его из них вычленить, а также не можем удалить из checkpoint-базы. В итоге
+	# мы рискуем, что этот трафик, который нынче лежит в checkpoint-базе, будет
+	# выведен в файлы при следующем запуске коллектора, и так возникнет дублирующийся
+	# трафик. Но мы ничего сделать не можем.
+	# Здесь мы не выходим, так как надо перенести файлы с трафиком в их целевой каталог.
+	ipacctctl "$ngipacct_node" clear \
+		|| {
+			echo "Failed to clear checkpoint-base. POSSIBLE TRAFFIC DUPING!" >&2
+		}
+
+	# В конце концов, если все прошло успешно (исключая последнюю ошибку с clear),
+	# то переносим файлы в конечный каталог с новым трафиком.
+	mv -f "$tmpifile" "$newifile" \
+		|| { echo "Can not move '$tmpifile' to '$newifile'."		>&2; }
+	mv -f "$tmpofile" "$newofile" \
+		|| { echo "Can not move '$tmpofile' to '$newofile'."		>&2; }
+
+	# Успешно выходим.
+	exit 0
+
+# Если же нас запустили без правильного второго параметра, то считаем что мы
+# должны организовать все необходимые lock'и и перезапустить себя с правильным
+# ключевым словом во втором параметре.
+else
+
+	# Составляем уникальное имя для lock-файла.
+	lckfile="$lckdir/collect.$identifier.lock"
+
+	# Запускаем себя же, но уже под lock'ом , чтобы избежать параллельных архиваций
+	# трафика того же интерфейса, что и мы сами. Иначе будет плохо.
+	lockf -k -s -t 0 "$lckfile" "$0" "$1" "do"
+
+	# Запоминаем с каким статусом вышел основной скрипт.
+	status="$?"
+
+	# Складываем трафик в базу сразу после его сбора, если нас попросили (в конфиге).
+	# Делаем это вне собственного lock'а, чтобы можно было запустить параллельную
+	# копию самого себя для сбора нового трафика, а складывание трафика чтобы этому
+	# запуску не помешало бы.
+	[ -z "$autoinject" ] || traffic_inject_mysql "$1"
+
+	# Выходим с запомненным ранее статусом основного скрипта.
+	exit "$status"
+
+fi
+
+#
+# Все.
+#

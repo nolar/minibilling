@@ -1,0 +1,13 @@
+#!/bin/sh
+#
+# (a) 2006 nolar@numeri.net
+#
+# ...
+#
+
+. /etc/traffic.conf
+
+identifier="ng0"
+ngipacct_node="${identifier}_ip_acct:${identifier}"
+autoinject="no"
+interface="1"
